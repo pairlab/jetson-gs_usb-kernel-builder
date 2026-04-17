@@ -1,0 +1,3 @@
+# module_name|config_symbol|module_dir
+gs_usb|CONFIG_CAN_GS_USB|drivers/net/can/usb
+peak_usb|CONFIG_CAN_PEAK_USB|drivers/net/can/usb
