@@ -91,6 +91,7 @@ fi
 KERNEL_VERSION=""
 MODULES_FILE="modules.txt"
 SCRIPT_DIR="$(pwd)"
+SOURCES_DIR="$SCRIPT/sources"
 DRY_RUN=0
 
 # Parsed module entries: "module_name|config_symbol|module_dir"
@@ -522,8 +523,8 @@ setup_toolchain_if_needed() {
 prepare_build_tree() {
     print_header "INITIAL SETUP"
 
-    run_cmd mkdir -p "$SCRIPT_DIR/$KERNEL_VERSION"
-    cd "$SCRIPT_DIR/$KERNEL_VERSION"
+    run_cmd mkdir -p "$SOURCES_DIR/$KERNEL_VERSION"
+    cd "$SOURCES_DIR/$KERNEL_VERSION"
 
     SRC_PATH="$PWD"
     OUT_PATH="$SRC_PATH/kernel_out"
@@ -532,6 +533,7 @@ prepare_build_tree() {
     print_info "Script directory: $SCRIPT_DIR"
     print_info "Build root: $SRC_PATH"
     print_info "Output path: $OUT_PATH"
+    print_info "Sources directory: $SOURCES_DIR"
     print_info "Target L4T version: $KERNEL_VERSION"
 
     if [[ $IS_ARM64 -eq 1 ]]; then
