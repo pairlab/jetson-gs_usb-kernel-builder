@@ -616,23 +616,28 @@ install_or_export_modules() {
     for entry in "${MODULE_ENTRIES[@]}"; do
         IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
 
-        local module_source_path="$OUT_PATH/$module_dir/$module_name.ko"
-        local module_install_path="$MODULE_INSTALL_BASE/${module_dir#drivers/}"
+        local module_source_root="$OUT_PATH/$module_dir/"
+        local module_dest_root="$MODULE_INSTALL_BASE/${module_dir#drivers/}/"
 
-        if [[ $DRY_RUN -eq 0 && ! -f "$module_source_path" ]]; then
-            print_error "Built module not found: $module_source_path"
+        if [[ $DRY_RUN -eq 0 && ! -d "$module_source_root" ]]; then
+            print_error "Built module directory not found: $module_source_root"
             exit 1
         fi
 
         if [[ $IS_ARM64 -eq 1 ]]; then
-            print_step "Installing $module_name to Jetson"
+            print_step "Installing modules from $module_dir to Jetson"
             if [[ $DRY_RUN -eq 1 ]]; then
-                echo "[DRY-RUN] sudo mkdir -p \"$module_install_path\""
-                echo "[DRY-RUN] sudo cp -v \"$module_source_path\" \"$module_install_path/\""
-                echo "[DRY-RUN] ensure '$module_name' exists in /etc/modules"
+                echo "[DRY-RUN] sudo mkdir -p \"$module_dest_root\""
+                echo "[DRY-RUN] sudo rsync -av --include='*/' --include='*.ko' --exclude='*' \"$module_source_root\" \"$module_dest_root\""
+                echo "[DRY-RUN] ensure requested module names are present in /etc/modules"
             else
-                sudo mkdir -p "$module_install_path"
-                sudo cp -v "$module_source_path" "$module_install_path/"
+                sudo mkdir -p "$module_dest_root"
+                sudo rsync -av \
+                    --include='*/' \
+                    --include='*.ko' \
+                    --exclude='*' \
+                    "$module_source_root" \
+                    "$module_dest_root"
 
                 if ! grep -q "^$module_name$" /etc/modules; then
                     echo "$module_name" | sudo tee -a /etc/modules >/dev/null
@@ -642,12 +647,21 @@ install_or_export_modules() {
                 fi
             fi
         else
-            print_step "Copying $module_name.ko to script directory"
+            local export_root="$SCRIPT_DIR/exported_modules/${module_dir#drivers/}/"
+
+            print_step "Exporting built modules from $module_dir with preserved subtree"
             if [[ $DRY_RUN -eq 1 ]]; then
-                echo "[DRY-RUN] cp -v \"$module_source_path\" \"$SCRIPT_DIR/\""
+                echo "[DRY-RUN] mkdir -p \"$export_root\""
+                echo "[DRY-RUN] rsync -av --include='*/' --include='*.ko' --exclude='*' \"$module_source_root\" \"$export_root\""
             else
-                cp -v "$module_source_path" "$SCRIPT_DIR/"
-                print_success "Exported: $SCRIPT_DIR/$module_name.ko"
+                mkdir -p "$export_root"
+                rsync -av \
+                    --include='*/' \
+                    --include='*.ko' \
+                    --exclude='*' \
+                    "$module_source_root" \
+                    "$export_root"
+                print_success "Exported modules under: $export_root"
             fi
         fi
     done
@@ -663,10 +677,10 @@ install_or_export_modules() {
         fi
     else
         print_header "JETSON INSTALLATION INSTRUCTIONS"
-        echo -e "Copy the generated .ko files into a directory on the target Jetson"
+        echo -e "Copy the generated exported_modules tree to the target Jetson."
         echo
         echo -e "Then run on the Jetson:"
-        echo -e "  ${YELLOW}./install-kernel-objects.sh --modules-file <module file> --source-dir <directory containing .ko>${NC}"
+        echo -e "  ${YELLOW}sudo rsync -av exported_modules/ /lib/modules/\$(uname -r)/kernel/${NC}"
         echo -e "  ${YELLOW}sudo depmod -a${NC}"
         echo -e "  ${YELLOW}sudo reboot${NC}"
     fi
