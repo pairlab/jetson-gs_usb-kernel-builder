@@ -91,7 +91,7 @@ fi
 KERNEL_VERSION=""
 MODULES_FILE="modules.txt"
 SCRIPT_DIR="$(pwd)"
-SOURCES_DIR="$SCRIPT/sources"
+SOURCES_DIR="$SCRIPT_DIR/sources"
 DRY_RUN=0
 
 # Parsed module entries: "module_name|config_symbol|module_dir"
