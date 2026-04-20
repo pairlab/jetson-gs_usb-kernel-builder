@@ -12,7 +12,8 @@ set -euo pipefail
 #   - Native Jetson: auto-discovers L4T version unless --kernel-version is given
 #   - Cross-compile: requires --kernel-version
 #   - Builds multiple modules from a modules.txt file
-#   - Uses explicit release lookup for both public sources and toolchain
+#   - Prints parsed module entries during validation
+#   - Supports dry-run mode
 # ==============================================================================
 
 # Colors for formatting
@@ -48,11 +49,12 @@ print_error() {
 usage() {
     cat <<EOF
 Usage:
-  $0 [--kernel-version VERSION] [--modules-file FILE]
+  $0 [--kernel-version VERSION] [--modules-file FILE] [--dry-run]
 
 Options:
   --kernel-version VERSION   Target L4T version (example: 36.4.3)
   --modules-file FILE        Module definition file (default: modules.txt)
+  --dry-run                  Print what would be done without making changes
   -h, --help                 Show this help
 
 Behavior:
@@ -89,6 +91,10 @@ fi
 KERNEL_VERSION=""
 MODULES_FILE="modules.txt"
 SCRIPT_DIR="$(pwd)"
+DRY_RUN=0
+
+# Parsed module entries: "module_name|config_symbol|module_dir"
+declare -a MODULE_ENTRIES=()
 
 # Resolved later by lookup
 NVIDIA_RELEASE_PATH=""
@@ -103,6 +109,17 @@ OUT_PATH=""
 BUILD_ROOT=""
 MODULE_INSTALL_BASE=""
 TARGET_UNAME_R=""
+
+# ------------------------------------------------------------------------------
+# Command helpers
+# ------------------------------------------------------------------------------
+run_cmd() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] $*"
+    else
+        "$@"
+    fi
+}
 
 # ------------------------------------------------------------------------------
 # Argument parsing
@@ -124,6 +141,10 @@ while [[ $# -gt 0 ]]; do
             fi
             MODULES_FILE="$2"
             shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
             ;;
         -h|--help)
             usage
@@ -184,6 +205,12 @@ resolve_release_info() {
 
 check_url_exists() {
     local url="$1"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] wget --spider -q \"$url\""
+        return 0
+    fi
+
     wget --spider -q "$url"
 }
 
@@ -197,11 +224,12 @@ validate_modules_file() {
 
     local line_no=0
     local valid_count=0
+    MODULE_ENTRIES=()
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         line_no=$((line_no + 1))
 
-        # Trim leading/trailing whitespace for simple emptiness check
+        # Trim leading/trailing whitespace
         local trimmed
         trimmed="$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
 
@@ -210,12 +238,25 @@ validate_modules_file() {
 
         IFS='|' read -r module_name config_symbol module_dir extra <<< "$trimmed"
 
-        if [[ -n "${extra:-}" || -z "${module_name:-}" || -z "${config_symbol:-}" || -z "${module_dir:-}" ]]; then
+        # Trim each field
+        module_name="$(echo "${module_name:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        config_symbol="$(echo "${config_symbol:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        module_dir="$(echo "${module_dir:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        extra="$(echo "${extra:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+        # Remove CR if file uses CRLF line endings
+        module_name="${module_name%$'\r'}"
+        config_symbol="${config_symbol%$'\r'}"
+        module_dir="${module_dir%$'\r'}"
+        extra="${extra%$'\r'}"
+
+        if [[ -n "$extra" || -z "$module_name" || -z "$config_symbol" || -z "$module_dir" ]]; then
             print_error "Invalid modules file entry at line $line_no: $line"
             print_error "Expected format: module_name|config_symbol|module_dir"
             exit 1
         fi
 
+        MODULE_ENTRIES+=("${module_name}|${config_symbol}|${module_dir}")
         valid_count=$((valid_count + 1))
     done < "$file"
 
@@ -223,6 +264,16 @@ validate_modules_file() {
         print_error "No valid module entries found in $file"
         exit 1
     fi
+
+    print_info "Modules found in $file:"
+    local idx=0
+    local entry
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        idx=$((idx + 1))
+        local module_name config_symbol module_dir
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
+        print_info "  [$idx] module_name=$module_name | config_symbol=$config_symbol | module_dir=$module_dir"
+    done
 }
 
 enable_module_config() {
@@ -236,24 +287,40 @@ enable_module_config() {
 
     if grep -q "^${config_symbol}=y$" "$config_file"; then
         print_step "Changing ${config_symbol}=y to ${config_symbol}=m"
-        sed -i "s/^${config_symbol}=y$/${config_symbol}=m/" "$config_file"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] sed -i \"s/^${config_symbol}=y$/${config_symbol}=m/\" \"$config_file\""
+        else
+            sed -i "s/^${config_symbol}=y$/${config_symbol}=m/" "$config_file"
+        fi
         return 0
     fi
 
     if grep -q "^# ${config_symbol} is not set$" "$config_file"; then
         print_step "Enabling ${config_symbol}=m"
-        sed -i "s/^# ${config_symbol} is not set$/${config_symbol}=m/" "$config_file"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] sed -i \"s/^# ${config_symbol} is not set$/${config_symbol}=m/\" \"$config_file\""
+        else
+            sed -i "s/^# ${config_symbol} is not set$/${config_symbol}=m/" "$config_file"
+        fi
         return 0
     fi
 
     if grep -q "^${config_symbol}=" "$config_file"; then
         print_step "Updating ${config_symbol} to module"
-        sed -i "s/^${config_symbol}=.*/${config_symbol}=m/" "$config_file"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] sed -i \"s/^${config_symbol}=.*/${config_symbol}=m/\" \"$config_file\""
+        else
+            sed -i "s/^${config_symbol}=.*/${config_symbol}=m/" "$config_file"
+        fi
         return 0
     fi
 
     print_step "Appending ${config_symbol}=m"
-    echo "${config_symbol}=m" >> "$config_file"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] echo \"${config_symbol}=m\" >> \"$config_file\""
+    else
+        echo "${config_symbol}=m" >> "$config_file"
+    fi
 }
 
 install_dependencies() {
@@ -267,21 +334,29 @@ install_dependencies() {
     fi
 
     print_step "Updating package list..."
-    sudo apt-get update -qq
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] sudo apt-get update -qq"
+    else
+        sudo apt-get update -qq
+    fi
 
     print_step "Installing required packages..."
-    sudo apt-get install -qq -y \
-        build-essential \
-        bc \
-        libssl-dev \
-        flex \
-        bison \
-        wget \
-        git \
-        pv \
-        kmod \
-        ca-certificates \
-        libelf-dev
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] sudo apt-get install -qq -y build-essential bc libssl-dev flex bison wget git pv kmod ca-certificates libelf-dev"
+    else
+        sudo apt-get install -qq -y \
+            build-essential \
+            bc \
+            libssl-dev \
+            flex \
+            bison \
+            wget \
+            git \
+            pv \
+            kmod \
+            ca-certificates \
+            libelf-dev
+    fi
 
     print_success "Dependencies installed"
 }
@@ -293,7 +368,11 @@ prepare_kernel_config() {
         if [[ ! -f "$SCRIPT_DIR/config" ]]; then
             print_step "Generating kernel config from running Jetson..."
             if [[ -f /proc/config.gz ]]; then
-                zcat /proc/config.gz > "$SCRIPT_DIR/config"
+                if [[ $DRY_RUN -eq 1 ]]; then
+                    echo "[DRY-RUN] zcat /proc/config.gz > \"$SCRIPT_DIR/config\""
+                else
+                    zcat /proc/config.gz > "$SCRIPT_DIR/config"
+                fi
             else
                 print_error "/proc/config.gz not found on this Jetson"
                 print_error "Provide a config file manually at: $SCRIPT_DIR/config"
@@ -312,16 +391,19 @@ prepare_kernel_config() {
         print_info "Using provided target config file: $SCRIPT_DIR/config"
     fi
 
-    cp "$SCRIPT_DIR/config" "$OUT_PATH/.config"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] cp \"$SCRIPT_DIR/config\" \"$OUT_PATH/.config\""
+    else
+        cp "$SCRIPT_DIR/config" "$OUT_PATH/.config"
+    fi
     print_success "Copied config to $OUT_PATH/.config"
 
     print_step "Enabling requested module configs..."
-    while IFS='|' read -r module_name config_symbol module_dir; do
-        [[ -z "${module_name// }" ]] && continue
-        [[ "$module_name" =~ ^[[:space:]]*# ]] && continue
-
+    local entry module_name config_symbol module_dir
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
         enable_module_config "$OUT_PATH/.config" "$config_symbol"
-    done < "$SCRIPT_DIR/$MODULES_FILE"
+    done
 }
 
 download_and_extract_sources() {
@@ -337,7 +419,11 @@ download_and_extract_sources() {
 
     if [[ ! -f "$SRC_PATH/public_sources.tbz2" ]]; then
         print_step "Downloading public_sources.tbz2..."
-        wget --show-progress -q -O "$SRC_PATH/public_sources.tbz2" "$PUBLIC_SOURCES_URL"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] wget --show-progress -q -O \"$SRC_PATH/public_sources.tbz2\" \"$PUBLIC_SOURCES_URL\""
+        else
+            wget --show-progress -q -O "$SRC_PATH/public_sources.tbz2" "$PUBLIC_SOURCES_URL"
+        fi
         print_success "Downloaded public_sources.tbz2"
     else
         print_info "public_sources.tbz2 already exists, skipping download"
@@ -346,26 +432,34 @@ download_and_extract_sources() {
     print_header "EXTRACTING PUBLIC SOURCES"
     if [[ ! -d "$SRC_PATH/Linux_for_Tegra/source" ]]; then
         print_step "Extracting public_sources.tbz2..."
-        (
-            cd "$SRC_PATH"
-            pv public_sources.tbz2 | tar xjf -
-        )
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] (cd \"$SRC_PATH\" && pv public_sources.tbz2 | tar xjf -)"
+        else
+            (
+                cd "$SRC_PATH"
+                pv public_sources.tbz2 | tar xjf -
+            )
+        fi
         print_success "Extraction complete"
     else
         print_info "Linux_for_Tegra/source already extracted"
     fi
 
-    if [[ ! -f "$SRC_PATH/Linux_for_Tegra/source/kernel_src.tbz2" ]]; then
+    if [[ $DRY_RUN -eq 0 && ! -f "$SRC_PATH/Linux_for_Tegra/source/kernel_src.tbz2" ]]; then
         print_error "kernel_src.tbz2 not found after extracting public sources"
         exit 1
     fi
 
     if [[ ! -d "$SRC_PATH/Linux_for_Tegra/source/kernel/kernel-jammy-src" ]]; then
         print_step "Extracting kernel_src.tbz2..."
-        (
-            cd "$SRC_PATH/Linux_for_Tegra/source"
-            tar xf kernel_src.tbz2
-        )
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] (cd \"$SRC_PATH/Linux_for_Tegra/source\" && tar xf kernel_src.tbz2)"
+        else
+            (
+                cd "$SRC_PATH/Linux_for_Tegra/source"
+                tar xf kernel_src.tbz2
+            )
+        fi
         print_success "Kernel sources extracted"
     else
         print_info "kernel-jammy-src already extracted"
@@ -390,7 +484,11 @@ setup_toolchain_if_needed() {
 
     if [[ ! -f "$SRC_PATH/$TOOLCHAIN_ARCHIVE_NAME" ]]; then
         print_step "Downloading cross-compilation toolchain..."
-        wget --show-progress -q -O "$SRC_PATH/$TOOLCHAIN_ARCHIVE_NAME" "$TOOLCHAIN_URL"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] wget --show-progress -q -O \"$SRC_PATH/$TOOLCHAIN_ARCHIVE_NAME\" \"$TOOLCHAIN_URL\""
+        else
+            wget --show-progress -q -O "$SRC_PATH/$TOOLCHAIN_ARCHIVE_NAME" "$TOOLCHAIN_URL"
+        fi
         print_success "Toolchain downloaded"
     else
         print_info "Toolchain archive already exists"
@@ -398,10 +496,14 @@ setup_toolchain_if_needed() {
 
     if [[ ! -d "$SRC_PATH/$TOOLCHAIN_DIR_NAME" ]]; then
         print_step "Extracting toolchain..."
-        (
-            cd "$SRC_PATH"
-            tar xf "$TOOLCHAIN_ARCHIVE_NAME"
-        )
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] (cd \"$SRC_PATH\" && tar xf \"$TOOLCHAIN_ARCHIVE_NAME\")"
+        else
+            (
+                cd "$SRC_PATH"
+                tar xf "$TOOLCHAIN_ARCHIVE_NAME"
+            )
+        fi
         print_success "Toolchain extracted"
     else
         print_info "Toolchain already extracted"
@@ -409,7 +511,7 @@ setup_toolchain_if_needed() {
 
     export CROSS_COMPILE="$SRC_PATH/$TOOLCHAIN_DIR_NAME/bin/aarch64-buildroot-linux-gnu-"
 
-    if [[ ! -x "${CROSS_COMPILE}gcc" ]]; then
+    if [[ $DRY_RUN -eq 0 && ! -x "${CROSS_COMPILE}gcc" ]]; then
         print_error "Cross compiler not found at expected path: ${CROSS_COMPILE}gcc"
         exit 1
     fi
@@ -420,12 +522,12 @@ setup_toolchain_if_needed() {
 prepare_build_tree() {
     print_header "INITIAL SETUP"
 
-    mkdir -p "$SCRIPT_DIR/$KERNEL_VERSION"
+    run_cmd mkdir -p "$SCRIPT_DIR/$KERNEL_VERSION"
     cd "$SCRIPT_DIR/$KERNEL_VERSION"
 
     SRC_PATH="$PWD"
     OUT_PATH="$SRC_PATH/kernel_out"
-    mkdir -p "$OUT_PATH"
+    run_cmd mkdir -p "$OUT_PATH"
 
     print_info "Script directory: $SCRIPT_DIR"
     print_info "Build root: $SRC_PATH"
@@ -436,7 +538,7 @@ prepare_build_tree() {
         TARGET_UNAME_R="$(uname -r)"
         MODULE_INSTALL_BASE="/lib/modules/$TARGET_UNAME_R/kernel"
     else
-        TARGET_UNAME_R="<target-jetson-uname-r>"
+        TARGET_UNAME_R="<target-jetson-uname-r>" # Not used
         MODULE_INSTALL_BASE="/lib/modules/$TARGET_UNAME_R/kernel"
     fi
 }
@@ -447,10 +549,20 @@ run_modules_prepare() {
     local kernel_src_dir="$SRC_PATH/Linux_for_Tegra/source/kernel/kernel-jammy-src"
     cd "$kernel_src_dir"
 
+    if [[ $DRY_RUN -eq 1 ]]; then
+        if [[ $IS_ARM64 -eq 1 ]]; then
+            echo "[DRY-RUN] make O=\"$OUT_PATH\" modules_prepare"
+        else
+            echo "[DRY-RUN] make O=\"$OUT_PATH\" ARCH=arm64 CROSS_COMPILE=\"$CROSS_COMPILE\" modules_prepare"
+        fi
+        print_success "Dry run: modules_prepare skipped"
+        return 0
+    fi
+
     if [[ $IS_ARM64 -eq 1 ]]; then
-        make O="$OUT_PATH" modules_prepare |& tee "$OUT_PATH/prepare.log"
+        make O="$OUT_PATH" modules_prepare </dev/null |& tee "$OUT_PATH/prepare.log"
     else
-        make O="$OUT_PATH" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" modules_prepare |& tee "$OUT_PATH/prepare.log"
+        make O="$OUT_PATH" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" modules_prepare </dev/null |& tee "$OUT_PATH/prepare.log"
     fi
 
     print_success "modules_prepare completed"
@@ -462,22 +574,33 @@ build_modules() {
     local kernel_src_dir="$SRC_PATH/Linux_for_Tegra/source/kernel/kernel-jammy-src"
     cd "$kernel_src_dir"
 
-    : > "$OUT_PATH/build.log"
+    if [[ $DRY_RUN -eq 0 ]]; then
+        : > "$OUT_PATH/build.log"
+    fi
 
-    while IFS='|' read -r module_name config_symbol module_dir; do
-        [[ -z "${module_name// }" ]] && continue
-        [[ "$module_name" =~ ^[[:space:]]*# ]] && continue
+    local entry module_name config_symbol module_dir
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
 
         print_step "Compiling module: $module_name"
         print_info " - Config: $config_symbol"
         print_info " - Directory: $module_dir"
 
-        if [[ $IS_ARM64 -eq 1 ]]; then
-            make O="$OUT_PATH" M="$module_dir" modules |& tee -a "$OUT_PATH/build.log"
-        else
-            make O="$OUT_PATH" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" M="$module_dir" modules |& tee -a "$OUT_PATH/build.log"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            if [[ $IS_ARM64 -eq 1 ]]; then
+                echo "[DRY-RUN] make O=\"$OUT_PATH\" M=\"$module_dir\" modules"
+            else
+                echo "[DRY-RUN] make O=\"$OUT_PATH\" ARCH=arm64 CROSS_COMPILE=\"$CROSS_COMPILE\" M=\"$module_dir\" modules"
+            fi
+            continue
         fi
-    done < "$SCRIPT_DIR/$MODULES_FILE"
+
+        if [[ $IS_ARM64 -eq 1 ]]; then
+            make O="$OUT_PATH" M="$module_dir" modules </dev/null |& tee -a "$OUT_PATH/build.log"
+        else
+            make O="$OUT_PATH" ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE" M="$module_dir" modules </dev/null |& tee -a "$OUT_PATH/build.log"
+        fi
+    done
 
     print_success "All requested modules compiled"
     print_info "Preparation log: $OUT_PATH/prepare.log"
@@ -487,48 +610,61 @@ build_modules() {
 install_or_export_modules() {
     print_header "INSTALLATION / POST-PROCESSING"
 
-    while IFS='|' read -r module_name config_symbol module_dir; do
-        [[ -z "${module_name// }" ]] && continue
-        [[ "$module_name" =~ ^[[:space:]]*# ]] && continue
+    local entry module_name config_symbol module_dir
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
 
         local module_source_path="$OUT_PATH/$module_dir/$module_name.ko"
         local module_install_path="$MODULE_INSTALL_BASE/${module_dir#drivers/}"
 
-        if [[ ! -f "$module_source_path" ]]; then
+        if [[ $DRY_RUN -eq 0 && ! -f "$module_source_path" ]]; then
             print_error "Built module not found: $module_source_path"
             exit 1
         fi
 
         if [[ $IS_ARM64 -eq 1 ]]; then
             print_step "Installing $module_name to Jetson"
-            sudo mkdir -p "$module_install_path"
-            sudo cp -v "$module_source_path" "$module_install_path/"
-
-            if ! grep -q "^$module_name$" /etc/modules; then
-                echo "$module_name" | sudo tee -a /etc/modules >/dev/null
-                print_success "$module_name added to /etc/modules"
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] sudo mkdir -p \"$module_install_path\""
+                echo "[DRY-RUN] sudo cp -v \"$module_source_path\" \"$module_install_path/\""
+                echo "[DRY-RUN] ensure '$module_name' exists in /etc/modules"
             else
-                print_info "$module_name already present in /etc/modules"
+                sudo mkdir -p "$module_install_path"
+                sudo cp -v "$module_source_path" "$module_install_path/"
+
+                if ! grep -q "^$module_name$" /etc/modules; then
+                    echo "$module_name" | sudo tee -a /etc/modules >/dev/null
+                    print_success "$module_name added to /etc/modules"
+                else
+                    print_info "$module_name already present in /etc/modules"
+                fi
             fi
         else
             print_step "Copying $module_name.ko to script directory"
-            cp -v "$module_source_path" "$SCRIPT_DIR/"
-            print_success "Exported: $SCRIPT_DIR/$module_name.ko"
+            if [[ $DRY_RUN -eq 1 ]]; then
+                echo "[DRY-RUN] cp -v \"$module_source_path\" \"$SCRIPT_DIR/\""
+            else
+                cp -v "$module_source_path" "$SCRIPT_DIR/"
+                print_success "Exported: $SCRIPT_DIR/$module_name.ko"
+            fi
         fi
-    done < "$SCRIPT_DIR/$MODULES_FILE"
+    done
 
     if [[ $IS_ARM64 -eq 1 ]]; then
         print_step "Updating module dependencies..."
-        sudo depmod -a
-        print_success "Installation complete. Reboot required."
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] sudo depmod -a"
+            print_success "Dry run complete. No installation changes were made."
+        else
+            sudo depmod -a
+            print_success "Installation complete. Reboot required."
+        fi
     else
         print_header "JETSON INSTALLATION INSTRUCTIONS"
-        echo -e "Copy the generated .ko files to the target Jetson and install them under:"
-        echo -e "  ${YELLOW}/lib/modules/<target-jetson-uname-r>/kernel/...${NC}"
+        echo -e "Copy the generated .ko files into a directory on the target Jetson"
         echo
         echo -e "Then run on the Jetson:"
-        echo -e "  ${YELLOW}sudo cp <module>.ko /lib/modules/<target-jetson-uname-r>/kernel/<module-subdir>/${NC}"
-        echo -e "  ${YELLOW}echo '<module>' | sudo tee -a /etc/modules${NC}"
+        echo -e "  ${YELLOW}./install-kernel-objects.sh --modules-file <module file> --source-dir <directory containing .ko>${NC}"
         echo -e "  ${YELLOW}sudo depmod -a${NC}"
         echo -e "  ${YELLOW}sudo reboot${NC}"
     fi
@@ -542,6 +678,10 @@ if [[ $IS_ARM64 -eq 1 ]]; then
     print_success "Running on ARM64 (Jetson - Native Mode)"
 else
     print_info "Running on $ARCHITECTURE (Cross-Compile Mode)"
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    print_info "Dry run mode enabled: no changes will be made"
 fi
 
 print_header "KERNEL VERSION RESOLUTION"
