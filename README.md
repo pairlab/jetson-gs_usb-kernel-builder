@@ -57,6 +57,33 @@ cd jetson-gs_usb-kernel-builder
 
 ---
 
+## 🟢 Native-headers mode (L4T R38 / Jetson Thor and any kernel with installed headers)
+
+On newer JetPack/L4T releases (e.g. **R38 / Thor, kernel 6.8.x**) the matching
+`linux-headers` package is already installed and `/lib/modules/$(uname -r)/build`
+points at a configured, prepared kernel build tree. In that case the script builds
+the modules **out-of-tree against the installed headers** instead of downloading the
+full NVIDIA public sources + toolchain:
+
+```bash
+./jetson-kernel-builder.sh --modules-file can_modules.txt
+```
+
+### ✔️ Behavior
+
+- Auto-detected when running on a Jetson and `/lib/modules/$(uname -r)/build` exists
+- Derives the matching upstream stable tag from `uname -r` (e.g. `6.8.12` → `v6.8.12`)
+- The headers package ships the build infrastructure but strips driver `.c/.h` files,
+  so those are fetched from `gregkh/linux` at that tag (resolving `#include` headers
+  recursively)
+- Forces the requested `CONFIG_*` symbols to `=m` on the make line (they are usually
+  "not set" in the running kernel `.config`)
+- Builds into `./can_build/`, installs the `.ko` files under
+  `/lib/modules/$(uname -r)/kernel/<module_dir>`, adds them to `/etc/modules`, runs `depmod`
+- Pass `--kernel-version VERSION` to force the public-sources download path instead
+
+---
+
 ## 🔁 Cross-Compilation Workflow (Jetson → Host → Jetson)
 
 ### 1. On Jetson: Export kernel config

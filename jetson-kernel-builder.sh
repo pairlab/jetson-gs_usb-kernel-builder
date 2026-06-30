@@ -94,6 +94,18 @@ SCRIPT_DIR="$(pwd)"
 SOURCES_DIR="$SCRIPT_DIR/sources"
 DRY_RUN=0
 
+# Native-headers build mode (Jetson with installed linux-headers, e.g. L4T R38 / Thor).
+# When the running kernel's build tree is present at /lib/modules/$(uname -r)/build we
+# build the requested modules out-of-tree against it instead of downloading the full
+# NVIDIA public sources + toolchain. The headers package ships the build infrastructure
+# but strips driver .c/.h files, so those are fetched from the matching upstream stable
+# tag derived from `uname -r`.
+NATIVE_HEADERS_MODE=0
+KERNEL_BUILD_TREE="/lib/modules/$(uname -r)/build"
+NATIVE_BUILD_DIR="$SCRIPT_DIR/can_build"
+KERNEL_SOURCE_TAG=""
+SOURCE_BASE_URL="https://raw.githubusercontent.com/gregkh/linux/KTAG/drivers"
+
 # Parsed module entries: "module_name|config_symbol|module_dir"
 declare -a MODULE_ENTRIES=()
 
@@ -330,7 +342,7 @@ install_dependencies() {
     if ! command -v apt-get >/dev/null 2>&1; then
         print_error "Non-apt based system detected. Install dependencies manually."
         echo "Required packages:"
-        echo "  build-essential bc libssl-dev flex bison wget git pv kmod ca-certificates libelf-dev"
+        echo "  build-essential bc libssl-dev flex bison wget curl git pv kmod ca-certificates libelf-dev"
         exit 1
     fi
 
@@ -343,7 +355,7 @@ install_dependencies() {
 
     print_step "Installing required packages..."
     if [[ $DRY_RUN -eq 1 ]]; then
-        echo "[DRY-RUN] sudo apt-get install -qq -y build-essential bc libssl-dev flex bison wget git pv kmod ca-certificates libelf-dev"
+        echo "[DRY-RUN] sudo apt-get install -qq -y build-essential bc libssl-dev flex bison wget curl git pv kmod ca-certificates libelf-dev"
     else
         sudo apt-get install -qq -y \
             build-essential \
@@ -352,6 +364,7 @@ install_dependencies() {
             flex \
             bison \
             wget \
+            curl \
             git \
             pv \
             kmod \
@@ -687,6 +700,245 @@ install_or_export_modules() {
 }
 
 # ------------------------------------------------------------------------------
+# Native-headers build path (build out-of-tree against installed kernel headers)
+# ------------------------------------------------------------------------------
+derive_kernel_source_tag() {
+    # 6.8.12-tegra -> v6.8.12 ; 5.15.148-tegra -> v5.15.148
+    local r
+    r="$(uname -r)"
+    r="${r%%-*}"
+    if [[ ! "$r" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        print_error "Could not derive an upstream source tag from kernel '$(uname -r)'"
+        exit 1
+    fi
+    KERNEL_SOURCE_TAG="v$r"
+}
+
+# Upstream URL for a path under drivers/ in the matching stable tag.
+source_url() {
+    echo "${SOURCE_BASE_URL/KTAG/$KERNEL_SOURCE_TAG}/$1"
+}
+
+# Fetch one file from upstream. Args: <url-path-under-drivers> <absolute-dest>.
+# No-op if the destination already exists.
+fetch_one() {
+    local url_path="$1" dest="$2"
+    [[ -f "$dest" ]] && return 0
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] curl -fsSL -o \"$dest\" \"$(source_url "$url_path")\""
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+    if ! curl -fsSL -o "$dest" "$(source_url "$url_path")"; then
+        print_error "Failed to fetch source: $(source_url "$url_path")"
+        exit 1
+    fi
+}
+
+# Fetch a source file and, recursively, the quoted local #include headers it
+# references. The build dir mirrors the upstream layout only *below* each module
+# root (flat at the root for single-file modules, under <module>/ for subdir
+# modules), so include paths resolve identically in upstream and local space.
+#   url_root   : upstream dir of the module root, under drivers/ (e.g. net/can/usb/peak_usb)
+#   local_root : local dir of the module root, under NATIVE_BUILD_DIR ("" or "peak_usb")
+#   rel        : file path relative to the module root (e.g. pcan_usb.c)
+fetch_with_includes() {
+    local url_root="$1" local_root="$2" rel="$3"
+
+    local url_path="${url_root:+$url_root/}$rel"
+    local dest="$NATIVE_BUILD_DIR/${local_root:+$local_root/}$rel"
+
+    fetch_one "$url_path" "$dest"
+
+    # In dry-run nothing is written, so includes cannot be scanned. The .c files
+    # (and any already-present headers) are reported; real runs resolve headers.
+    [[ $DRY_RUN -eq 1 ]] && return 0
+    [[ -f "$dest" ]] || return 0
+
+    local reldir inc resolved
+    reldir="$(dirname "$rel")"
+    while IFS= read -r inc; do
+        # Normalise the include path relative to the module root; skip if it escapes.
+        resolved="$(realpath -m --relative-base=. "${reldir}/${inc}" 2>/dev/null)"
+        resolved="${resolved#./}"
+        case "$resolved" in
+            ""|../*|/*) continue ;;
+        esac
+        if [[ ! -f "$NATIVE_BUILD_DIR/${local_root:+$local_root/}$resolved" ]]; then
+            fetch_with_includes "$url_root" "$local_root" "$resolved"
+        fi
+    done < <(grep -oE '#[[:space:]]*include[[:space:]]*"[^"]+"' "$dest" 2>/dev/null \
+                | sed -E 's/.*"([^"]+)".*/\1/')
+}
+
+# Determine the .o objects a module is built from (using the installed build tree's
+# Makefiles as the source of truth) and fetch the matching upstream sources into a
+# flat out-of-tree layout.
+fetch_module_sources() {
+    local module_name="$1"   # e.g. gs_usb / peak_usb
+    local module_dir="$2"    # e.g. drivers/net/can/usb
+    local url_dir="${module_dir#drivers/}"   # e.g. net/can/usb
+
+    print_step "Resolving source files for module: $module_name"
+
+    local dir_makefile="$KERNEL_BUILD_TREE/$module_dir/Makefile"
+    if [[ ! -f "$dir_makefile" ]]; then
+        print_error "Kernel build tree has no Makefile at $module_dir"
+        print_error "Cannot determine source files for $module_name"
+        exit 1
+    fi
+
+    # How is the module referenced in the directory Makefile?
+    #   obj-$(CONFIG_x) += gs_usb.o   -> single-file module
+    #   obj-$(CONFIG_x) += peak_usb/  -> subdirectory module
+    local ref
+    ref="$(grep -oE "\+=[[:space:]]*${module_name}(\.o|/)" "$dir_makefile" | head -n1 | sed -E 's/.*\+=[[:space:]]*//')"
+
+    if [[ "$ref" == "${module_name}.o" ]]; then
+        # Single-file module: sources live flat at the build-dir root.
+        fetch_with_includes "$url_dir" "" "${module_name}.c"
+    elif [[ "$ref" == "${module_name}/" ]]; then
+        # Subdirectory module: sources live under <module_name>/ in the build dir.
+        local sub_makefile="$KERNEL_BUILD_TREE/$module_dir/$module_name/Makefile"
+        if [[ ! -f "$sub_makefile" ]]; then
+            print_error "Subdirectory Makefile not found: $module_dir/$module_name/Makefile"
+            exit 1
+        fi
+        # Copy the subdir Makefile verbatim (it drives the out-of-tree build).
+        if [[ $DRY_RUN -eq 0 ]]; then
+            mkdir -p "$NATIVE_BUILD_DIR/$module_name"
+            cp "$sub_makefile" "$NATIVE_BUILD_DIR/$module_name/Makefile"
+        else
+            echo "[DRY-RUN] cp \"$sub_makefile\" \"$NATIVE_BUILD_DIR/$module_name/Makefile\""
+        fi
+        local objs obj
+        objs="$(grep -oE "${module_name}-y[[:space:]]*[:+]?=[[:space:]]*.*" "$sub_makefile" \
+                  | sed -E "s/${module_name}-y[[:space:]]*[:+]?=//" )"
+        for obj in $objs; do
+            [[ "$obj" == *.o ]] || continue
+            fetch_with_includes "$url_dir/$module_name" "$module_name" "${obj%.o}.c"
+        done
+    else
+        print_error "Could not find '$module_name' as an obj target in $module_dir/Makefile"
+        exit 1
+    fi
+}
+
+write_native_kbuild() {
+    # Top-level Kbuild driving the out-of-tree (M=) build. Entries are single-level
+    # (flat layout) so kbuild descends into subdir modules correctly.
+    local kbuild="$NATIVE_BUILD_DIR/Kbuild"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] write $kbuild"
+        return 0
+    fi
+
+    {
+        echo "# Auto-generated by jetson-kernel-builder.sh (native-headers mode)."
+        echo "# Out-of-tree build of the requested modules against the installed kernel headers."
+        local entry module_name config_symbol module_dir dir_makefile ref
+        for entry in "${MODULE_ENTRIES[@]}"; do
+            IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
+            dir_makefile="$KERNEL_BUILD_TREE/$module_dir/Makefile"
+            ref="$(grep -oE "\+=[[:space:]]*${module_name}(\.o|/)" "$dir_makefile" | head -n1 | sed -E 's/.*\+=[[:space:]]*//')"
+            if [[ "$ref" == "${module_name}/" ]]; then
+                echo "obj-m += $module_name/"
+            else
+                echo "obj-m += ${module_name}.o"
+            fi
+        done
+    } > "$kbuild"
+    print_info "Wrote out-of-tree Kbuild: $kbuild"
+}
+
+build_modules_native_headers() {
+    print_header "NATIVE-HEADERS BUILD (out-of-tree against installed kernel)"
+    print_info "Kernel build tree: $KERNEL_BUILD_TREE"
+    print_info "Upstream source tag: $KERNEL_SOURCE_TAG"
+    print_info "Build directory: $NATIVE_BUILD_DIR"
+
+    run_cmd mkdir -p "$NATIVE_BUILD_DIR"
+
+    local entry module_name config_symbol module_dir
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
+        fetch_module_sources "$module_name" "$module_dir"
+    done
+
+    write_native_kbuild
+
+    # The subdirectory Makefiles are copied verbatim and gate on obj-$(CONFIG_xxx).
+    # These symbols are typically "not set" in the running kernel's .config, so we
+    # force them to =m on the make command line (command-line vars override .config).
+    local config_overrides=()
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
+        config_overrides+=("${config_symbol}=m")
+    done
+
+    print_step "Compiling modules..."
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] make -C \"$KERNEL_BUILD_TREE\" M=\"$NATIVE_BUILD_DIR\" ${config_overrides[*]} modules"
+        print_success "Dry run: native build skipped"
+        return 0
+    fi
+
+    make -C "$KERNEL_BUILD_TREE" M="$NATIVE_BUILD_DIR" "${config_overrides[@]}" modules </dev/null \
+        |& tee "$NATIVE_BUILD_DIR/build.log"
+
+    print_success "Modules compiled. Produced:"
+    find "$NATIVE_BUILD_DIR" -name '*.ko' -printf '  %p\n'
+}
+
+install_modules_native_headers() {
+    print_header "INSTALLATION"
+
+    local target_uname_r install_base
+    target_uname_r="$(uname -r)"
+    install_base="/lib/modules/$target_uname_r/kernel"
+
+    local entry module_name config_symbol module_dir
+    for entry in "${MODULE_ENTRIES[@]}"; do
+        IFS='|' read -r module_name config_symbol module_dir <<< "$entry"
+
+        local ko
+        ko="$(find "$NATIVE_BUILD_DIR" -name "${module_name}.ko" | head -n1)"
+        if [[ -z "$ko" ]]; then
+            print_error "Built module not found: ${module_name}.ko"
+            exit 1
+        fi
+
+        local dest_dir="$install_base/$module_dir"
+        print_step "Installing ${module_name}.ko -> $dest_dir"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] sudo install -D -m 0644 \"$ko\" \"$dest_dir/${module_name}.ko\""
+        else
+            sudo install -D -m 0644 "$ko" "$dest_dir/${module_name}.ko"
+        fi
+
+        if [[ $DRY_RUN -eq 1 ]]; then
+            echo "[DRY-RUN] ensure $module_name present in /etc/modules"
+        elif ! grep -q "^$module_name$" /etc/modules; then
+            echo "$module_name" | sudo tee -a /etc/modules >/dev/null
+            print_success "$module_name added to /etc/modules"
+        else
+            print_info "$module_name already present in /etc/modules"
+        fi
+    done
+
+    print_step "Updating module dependencies..."
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "[DRY-RUN] sudo depmod -a"
+        print_success "Dry run complete. No installation changes were made."
+    else
+        sudo depmod -a
+        print_success "Installation complete. Load with: sudo modprobe <module>"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # Main flow
 # ------------------------------------------------------------------------------
 print_header "INITIAL CHECK"
@@ -698,6 +950,44 @@ fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
     print_info "Dry run mode enabled: no changes will be made"
+fi
+
+# Fall back to can_modules.txt (shipped in this repo) when the default modules.txt
+# is absent and no explicit --modules-file was given.
+if [[ "$MODULES_FILE" == "modules.txt" && ! -f "$MODULES_FILE" && -f "$SCRIPT_DIR/can_modules.txt" ]]; then
+    MODULES_FILE="$SCRIPT_DIR/can_modules.txt"
+    print_info "modules.txt not found; using can_modules.txt"
+fi
+
+# ------------------------------------------------------------------------------
+# Native-headers fast path: on a Jetson whose running kernel has an installed
+# build tree (linux-headers package, as on L4T R38 / Thor), build the modules
+# out-of-tree against it. This avoids downloading the full NVIDIA public sources
+# and works for releases not listed in resolve_release_info().
+# ------------------------------------------------------------------------------
+if [[ $IS_ARM64 -eq 1 && -z "$KERNEL_VERSION" && -e "$KERNEL_BUILD_TREE/Makefile" ]]; then
+    NATIVE_HEADERS_MODE=1
+fi
+
+if [[ $NATIVE_HEADERS_MODE -eq 1 ]]; then
+    print_header "NATIVE-HEADERS MODE"
+    print_success "Installed kernel build tree found: $KERNEL_BUILD_TREE"
+    print_info "Building out-of-tree against the running kernel ($(uname -r))."
+    print_info "Pass --kernel-version to force the public-sources download path instead."
+
+    derive_kernel_source_tag
+
+    print_header "MODULE FILE CHECK"
+    print_info "Modules file: $MODULES_FILE"
+    validate_modules_file "$MODULES_FILE"
+    print_success "Modules file is valid"
+
+    install_dependencies
+    build_modules_native_headers
+    install_modules_native_headers
+
+    print_header "PROCESS COMPLETED"
+    exit 0
 fi
 
 print_header "KERNEL VERSION RESOLUTION"

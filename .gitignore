@@ -3,3 +3,7 @@ sources
 
 # Queried config
 config
+
+# Native-headers out-of-tree build dir (fetched sources + .ko artifacts)
+can_build
+exported_modules
